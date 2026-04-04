@@ -38,6 +38,7 @@ export type Platform = "github" | "gitlab";
 /** GitHub PR reference */
 export interface GithubPRRef {
   platform: "github";
+  host: string;
   owner: string;
   repo: string;
   number: number;
@@ -57,6 +58,7 @@ export type PRRef = GithubPRRef | GitlabMRRef;
 /** GitHub PR metadata */
 export interface GithubPRMetadata {
   platform: "github";
+  host: string;
   owner: string;
   repo: string;
   number: number;
@@ -133,6 +135,7 @@ export interface PRContext {
   reviews: PRReview[];
   checks: PRCheck[];
   linkedIssues: PRLinkedIssue[];
+  inlineComments?: PRInlineComment[];
 }
 
 export interface PRReviewFileComment {
@@ -142,6 +145,24 @@ export interface PRReviewFileComment {
   body: string;
   start_line?: number;
   start_side?: "LEFT" | "RIGHT";
+}
+
+/** An existing inline review comment on a PR diff */
+export interface PRInlineComment {
+  id: number;
+  author: string;
+  body: string;
+  path: string;
+  line: number | null;
+  side: "LEFT" | "RIGHT";
+  createdAt: string;
+  url: string;
+  /** The review this comment belongs to (if any) */
+  inReplyToId?: number;
+  /** Start line for multi-line comments */
+  startLine?: number;
+  /** Original line for outdated comments */
+  originalLine?: number;
 }
 
 // --- Label Helpers ---
@@ -174,7 +195,7 @@ export function getDisplayRepo(m: HasPlatform): string {
 /** Reconstruct a PRRef from metadata */
 export function prRefFromMetadata(m: PRMetadata): PRRef {
   if (m.platform === "github") {
-    return { platform: "github", owner: m.owner, repo: m.repo, number: m.number };
+    return { platform: "github", host: m.host, owner: m.owner, repo: m.repo, number: m.number };
   }
   return { platform: "gitlab", host: m.host, projectPath: m.projectPath, iid: m.iid };
 }
@@ -203,27 +224,18 @@ export function encodeApiFilePath(filePath: string): string {
  *
  * Handles:
  * - GitHub: https://github.com/owner/repo/pull/123[/files|/commits]
+ * - GitHub Enterprise: https://ghe.company.com/owner/repo/pull/123
  * - GitLab: https://gitlab.com/group/subgroup/project/-/merge_requests/42[/diffs]
  * - Self-hosted GitLab: https://gitlab.mycompany.com/group/project/-/merge_requests/42
+ *
+ * GitLab is checked first because `/-/merge_requests/` is unambiguous,
+ * while `/pull/` could theoretically appear on any host.
  */
 export function parsePRUrl(url: string): PRRef | null {
   if (!url) return null;
 
-  // GitHub: https://github.com/{owner}/{repo}/pull/{number}[/...]
-  const ghMatch = url.match(
-    /^https?:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/,
-  );
-  if (ghMatch) {
-    return {
-      platform: "github",
-      owner: ghMatch[1],
-      repo: ghMatch[2],
-      number: parseInt(ghMatch[3], 10),
-    };
-  }
-
   // GitLab: https://{host}/{projectPath}/-/merge_requests/{iid}[/...]
-  // Handles any hostname, nested groups, self-hosted instances
+  // Checked first — `/-/merge_requests/` is the most specific pattern.
   const glMatch = url.match(
     /^https?:\/\/([^/]+)\/(.+?)\/-\/merge_requests\/(\d+)/,
   );
@@ -236,18 +248,32 @@ export function parsePRUrl(url: string): PRRef | null {
     };
   }
 
+  // GitHub (including GHE): https://{host}/{owner}/{repo}/pull/{number}[/...]
+  const ghMatch = url.match(
+    /^https?:\/\/([^/]+)\/([^/]+)\/([^/]+)\/pull\/(\d+)/,
+  );
+  if (ghMatch) {
+    return {
+      platform: "github",
+      host: ghMatch[1],
+      owner: ghMatch[2],
+      repo: ghMatch[3],
+      number: parseInt(ghMatch[4], 10),
+    };
+  }
+
   return null;
 }
 
 // --- Dispatch Functions ---
 
 export async function checkAuth(runtime: PRRuntime, ref: PRRef): Promise<void> {
-  if (ref.platform === "github") return checkGhAuth(runtime);
+  if (ref.platform === "github") return checkGhAuth(runtime, ref.host);
   return checkGlAuth(runtime, ref.host);
 }
 
 export async function getUser(runtime: PRRuntime, ref: PRRef): Promise<string | null> {
-  if (ref.platform === "github") return getGhUser(runtime);
+  if (ref.platform === "github") return getGhUser(runtime, ref.host);
   return getGlUser(runtime, ref.host);
 }
 

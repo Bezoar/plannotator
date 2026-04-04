@@ -1,7 +1,7 @@
 /**
  * Plannotator CLI for Claude Code & Copilot CLI
  *
- * Supports nine modes:
+ * Supports ten modes:
  *
  * 1. Plan Review (default, no args):
  *    - Spawned by ExitPlanMode hook (Claude Code)
@@ -47,7 +47,13 @@
  *    - Reads tool_input.command from stdin JSON, extracts review args
  *    - Runs review server (same as mode 2), outputs PreToolUse deny decision
  *
+ * 10. Improve Context (`plannotator improve-context`):
+ *    - Spawned by PreToolUse hook on EnterPlanMode
+ *    - Reads improvement hook file from ~/.plannotator/hooks/
+ *    - Returns additionalContext or silently passes through
+ *
  * Global flags:
+ *   --help             - Show top-level usage information
  *   --browser <name>   - Override which browser to open (e.g. "Google Chrome")
  *
  * Environment variables:
@@ -67,7 +73,7 @@ import {
   startAnnotateServer,
   handleAnnotateServerReady,
 } from "@plannotator/server/annotate";
-import { getGitContext, runGitDiff } from "@plannotator/server/git";
+import { type DiffType, getVcsContext, runVcsDiff } from "@plannotator/server/vcs";
 import { parsePRUrl, checkPRAuth, fetchPR, getCliName, getCliInstallUrl, getMRLabel, getMRNumberLabel, getDisplayRepo } from "@plannotator/server/pr";
 import { writeRemoteShareLink } from "@plannotator/server/share-url";
 import { resolveMarkdownFile, hasMarkdownFiles } from "@plannotator/shared/resolve-file";
@@ -77,11 +83,19 @@ import { registerSession, unregisterSession, listSessions } from "@plannotator/s
 import { openBrowser } from "@plannotator/server/browser";
 import { detectProjectName } from "@plannotator/server/project";
 import { planDenyFeedback } from "@plannotator/shared/feedback-templates";
+import { readImprovementHook } from "@plannotator/shared/improvement-hooks";
 import type { Origin } from "@plannotator/shared/agents";
 import { findSessionLogsForCwd, resolveSessionLogByPpid, findSessionLogsByAncestorWalk, getLastRenderedMessage, type RenderedMessage } from "./session-log";
 import { findCodexRolloutByThreadId, getLastCodexMessage } from "./codex-session";
 import { findCopilotPlanContent, findCopilotSessionForCwd, getLastCopilotMessage } from "./copilot-session";
+import {
+  formatInteractiveNoArgClarification,
+  formatTopLevelHelp,
+  isInteractiveNoArgInvocation,
+  isTopLevelHelpInvocation,
+} from "./cli";
 import path from "path";
+import { isSpawnMode, spawnClaudeSession } from "@plannotator/server/spawn";
 
 // Embed the built HTML at compile time
 // @ts-ignore - Bun import attribute for text
@@ -100,6 +114,22 @@ const browserIdx = args.indexOf("--browser");
 if (browserIdx !== -1 && args[browserIdx + 1]) {
   process.env.PLANNOTATOR_BROWSER = args[browserIdx + 1];
   args.splice(browserIdx, 2);
+}
+
+// Global flag: --spawn (or PLANNOTATOR_SPAWN env var)
+const spawnFlag = isSpawnMode();
+// Remove --spawn from args so it doesn't confuse subcommand routing
+const spawnIdx = args.indexOf("--spawn");
+if (spawnIdx !== -1) args.splice(spawnIdx, 1);
+
+if (isTopLevelHelpInvocation(args)) {
+  console.log(formatTopLevelHelp());
+  process.exit(0);
+}
+
+if (isInteractiveNoArgInvocation(args, process.stdin.isTTY)) {
+  console.log(formatInteractiveNoArgClarification());
+  process.exit(0);
 }
 
 // Ensure session cleanup on exit
@@ -131,6 +161,7 @@ const detectedOrigin: Origin =
 async function runAnnotateFlow(
   filePath: string,
   projectRoot: string,
+  spawn?: boolean,
 ): Promise<string> {
   // Strip @ prefix if present (Claude Code file reference syntax)
   if (filePath.startsWith("@")) {
@@ -194,6 +225,7 @@ async function runAnnotateFlow(
     sharingEnabled,
     shareBaseUrl,
     pasteApiUrl,
+    spawn,
     htmlContent: planHtmlContent,
     onReady: async (url, isRemote, port) => {
       handleAnnotateServerReady(url, isRemote, port);
@@ -238,6 +270,7 @@ async function runAnnotateFlow(
 async function runReviewFlow(
   reviewArg: string | undefined,
   projectRoot: string,
+  spawn?: boolean,
 ): Promise<string> {
   const isPRMode =
     reviewArg?.startsWith("http://") || reviewArg?.startsWith("https://");
@@ -245,10 +278,11 @@ async function runReviewFlow(
   let rawPatch: string;
   let gitRef: string;
   let diffError: string | undefined;
-  let gitContext: Awaited<ReturnType<typeof getGitContext>> | undefined;
+  let gitContext: Awaited<ReturnType<typeof getVcsContext>> | undefined;
   let prMetadata:
     | Awaited<ReturnType<typeof fetchPR>>["metadata"]
     | undefined;
+  let initialDiffType: DiffType | undefined;
 
   if (isPRMode) {
     const prRef = parsePRUrl(reviewArg!);
@@ -287,8 +321,9 @@ async function runReviewFlow(
       );
     }
   } else {
-    gitContext = await getGitContext();
-    const diffResult = await runGitDiff("uncommitted", gitContext.defaultBranch);
+    gitContext = await getVcsContext();
+    initialDiffType = gitContext.vcsType === "p4" ? "p4-default" : "uncommitted";
+    const diffResult = await runVcsDiff(initialDiffType, gitContext.defaultBranch);
     rawPatch = diffResult.patch;
     gitRef = diffResult.label;
     diffError = diffResult.error;
@@ -301,11 +336,12 @@ async function runReviewFlow(
     gitRef,
     error: diffError,
     origin: detectedOrigin,
-    diffType: isPRMode ? undefined : "uncommitted",
+    diffType: isPRMode ? undefined : (initialDiffType ?? "uncommitted"),
     gitContext,
     prMetadata,
     sharingEnabled,
     shareBaseUrl,
+    spawn,
     htmlContent: reviewHtmlContent,
     onReady: async (url, isRemote, port) => {
       handleReviewServerReady(url, isRemote, port);
@@ -402,7 +438,18 @@ if (args[0] === "sessions") {
   const projectRoot = process.env.PLANNOTATOR_CWD || process.cwd();
 
   try {
-    const feedback = await runReviewFlow(args[1], projectRoot);
+    const feedback = await runReviewFlow(args[1], projectRoot, spawnFlag);
+
+    if (spawnFlag && feedback) {
+      const prompt = [
+        "# Code Review Feedback\n",
+        feedback,
+        "\n\nPlease address the review feedback above.",
+      ].join("\n");
+      const exitCode = await spawnClaudeSession(projectRoot, prompt);
+      process.exit(exitCode);
+    }
+
     console.log(feedback);
   } catch (err) {
     console.error(err instanceof Error ? err.message : String(err));
@@ -424,12 +471,144 @@ if (args[0] === "sessions") {
   const projectRoot = process.env.PLANNOTATOR_CWD || process.cwd();
 
   try {
-    const feedback = await runAnnotateFlow(filePath, projectRoot);
+    const feedback = await runAnnotateFlow(filePath, projectRoot, spawnFlag);
+
+    if (spawnFlag && feedback) {
+      const prompt = [
+        "# Annotation Feedback\n",
+        feedback,
+        "\n\nPlease address the annotations above.",
+      ].join("\n");
+      const exitCode = await spawnClaudeSession(projectRoot, prompt);
+      process.exit(exitCode);
+    }
+
     console.log(feedback);
   } catch (err) {
     console.error(err instanceof Error ? err.message : String(err));
     process.exit(1);
   }
+  process.exit(0);
+
+} else if (args[0] === "plan") {
+  // ============================================
+  // STANDALONE PLAN REVIEW MODE
+  // ============================================
+  // Opens plan review UI with content from a file, archive, or stdin.
+  // With --spawn / PLANNOTATOR_SPAWN: spawns a new `claude` session with feedback.
+
+  const projectRoot = process.env.PLANNOTATOR_CWD || process.cwd();
+  const planProject = (await detectProjectName()) ?? "_unknown";
+
+  let planContent = "";
+
+  if (args.includes("--archive")) {
+    // Archive mode: open archive browser, user picks a plan
+    const server = await startPlannotatorServer({
+      plan: "",
+      origin: detectedOrigin,
+      mode: "archive",
+      sharingEnabled,
+      shareBaseUrl,
+      spawn: spawnFlag,
+      htmlContent: planHtmlContent,
+      onReady: (url, isRemote, port) => {
+        handleServerReady(url, isRemote, port);
+      },
+    });
+
+    registerSession({
+      pid: process.pid,
+      port: server.port,
+      url: server.url,
+      mode: "archive",
+      project: planProject,
+      startedAt: new Date().toISOString(),
+      label: `plan-archive-${planProject}`,
+    });
+
+    await server.waitForDone!();
+    await Bun.sleep(500);
+    server.stop();
+    process.exit(0);
+  }
+
+  // Determine plan source: file path or stdin (-)
+  const source = args[1];
+  if (!source) {
+    console.error("Usage: plannotator plan <file.md | --archive | ->");
+    process.exit(1);
+  }
+
+  if (source === "-") {
+    // Read from stdin
+    planContent = await Bun.stdin.text();
+  } else {
+    // Read from file
+    const { resolve } = await import("node:path");
+    const filePath = resolve(projectRoot, source);
+    try {
+      planContent = await Bun.file(filePath).text();
+    } catch {
+      console.error(`Cannot read file: ${filePath}`);
+      process.exit(1);
+    }
+  }
+
+  if (!planContent.trim()) {
+    console.error("Empty plan content");
+    process.exit(1);
+  }
+
+  // Start the plan review server
+  const server = await startPlannotatorServer({
+    plan: planContent,
+    origin: detectedOrigin,
+    sharingEnabled,
+    shareBaseUrl,
+    pasteApiUrl,
+    spawn: spawnFlag,
+    htmlContent: planHtmlContent,
+    onReady: (url, isRemote, port) => {
+      handleServerReady(url, isRemote, port);
+    },
+  });
+
+  registerSession({
+    pid: process.pid,
+    port: server.port,
+    url: server.url,
+    mode: "plan",
+    project: planProject,
+    startedAt: new Date().toISOString(),
+    label: `plan-${planProject}`,
+  });
+
+  const result = await server.waitForDecision();
+  await Bun.sleep(1500);
+  server.stop();
+
+  if (spawnFlag && !result.approved && result.feedback) {
+    // Spawn mode: launch claude with the plan + feedback
+    const prompt = [
+      "# Plan Review Feedback\n",
+      "## Original Plan\n",
+      planContent,
+      "\n\n## Reviewer Feedback\n",
+      result.feedback,
+      "\n\nPlease address the feedback in the annotations above.",
+    ].join("\n");
+
+    const exitCode = await spawnClaudeSession(projectRoot, prompt);
+    process.exit(exitCode);
+  } else if (spawnFlag && result.approved) {
+    // Dismiss — no action
+    process.exit(0);
+  } else if (result.feedback) {
+    // Non-spawn mode: print feedback to stdout
+    console.log(result.feedback);
+  }
+
   process.exit(0);
 
 } else if (args[0] === "annotate-hook") {
@@ -819,6 +998,37 @@ if (args[0] === "sessions") {
   console.log(result.feedback || "No feedback provided.");
   process.exit(0);
 
+} else if (args[0] === "improve-context") {
+  // ============================================
+  // IMPROVEMENT HOOK CONTEXT INJECTION MODE
+  // ============================================
+  //
+  // Called by PreToolUse hook on EnterPlanMode.
+  // Reads the improvement hook file and returns additionalContext.
+  // No file = exit 0 silently (passthrough).
+
+  // Must consume stdin (Claude Code hooks deliver event JSON on stdin)
+  await Bun.stdin.text();
+
+  const hook = readImprovementHook("enterplanmode-improve");
+  if (!hook) process.exit(0);
+
+  const context = [
+    "[Plannotator Improvement Hook]",
+    "The following corrective instructions were generated from analysis of previous plan denial patterns.",
+    "Apply these guidelines when writing your plan:\n",
+    hook.content,
+  ].join("\n");
+
+  console.log(JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      additionalContext: context,
+    },
+  }));
+
+  process.exit(0);
+
 } else {
   // ============================================
   // PLAN REVIEW MODE (default)
@@ -829,12 +1039,30 @@ if (args[0] === "sessions") {
 
   let planContent = "";
   let permissionMode = "default";
+  let isGemini = false;
+  let planFilename = "";
+  let event: Record<string, any>;
   try {
-    const event = JSON.parse(eventJson);
-    planContent = event.tool_input?.plan || "";
+    event = JSON.parse(eventJson);
+
+    // Detect harness: Gemini sends plan_filename (file on disk), Claude Code sends plan (inline)
+    planFilename = event.tool_input?.plan_filename || event.tool_input?.plan_path || "";
+    isGemini = !!planFilename;
+
+    if (isGemini) {
+      // Reconstruct full plan path from transcript_path and session_id:
+      // transcript_path = <projectTempDir>/chats/session-...json
+      // plan lives at   = <projectTempDir>/<session_id>/plans/<plan_filename>
+      const projectTempDir = path.dirname(path.dirname(event.transcript_path));
+      const planFilePath = path.join(projectTempDir, event.session_id, "plans", planFilename);
+      planContent = await Bun.file(planFilePath).text();
+    } else {
+      planContent = event.tool_input?.plan || "";
+    }
+
     permissionMode = event.permission_mode || "default";
-  } catch {
-    console.error("Failed to parse hook event from stdin");
+  } catch (e: any) {
+    console.error(`Failed to parse hook event from stdin: ${e?.message || e}`);
     process.exit(1);
   }
 
@@ -848,7 +1076,7 @@ if (args[0] === "sessions") {
   // Start the plan review server
   const server = await startPlannotatorServer({
     plan: planContent,
-    origin: detectedOrigin,
+    origin: isGemini ? "gemini-cli" : detectedOrigin,
     permissionMode,
     sharingEnabled,
     shareBaseUrl,
@@ -882,41 +1110,56 @@ if (args[0] === "sessions") {
   // Cleanup
   server.stop();
 
-  // Output JSON for PermissionRequest hook decision control
-  if (result.approved) {
-    // Build updatedPermissions to preserve the current permission mode
-    const updatedPermissions = [];
-    if (result.permissionMode) {
-      updatedPermissions.push({
-        type: "setMode",
-        mode: result.permissionMode,
-        destination: "session",
-      });
+  // Output decision in the appropriate format for the harness
+  if (isGemini) {
+    if (result.approved) {
+      console.log(result.feedback ? JSON.stringify({ systemMessage: result.feedback }) : "{}");
+    } else {
+      console.log(
+        JSON.stringify({
+          decision: "deny",
+          reason: planDenyFeedback(result.feedback || "", "exit_plan_mode", {
+            planFilePath: planFilename,
+          }),
+        })
+      );
     }
-
-    console.log(
-      JSON.stringify({
-        hookSpecificOutput: {
-          hookEventName: "PermissionRequest",
-          decision: {
-            behavior: "allow",
-            ...(updatedPermissions.length > 0 && { updatedPermissions }),
-          },
-        },
-      })
-    );
   } else {
-    console.log(
-      JSON.stringify({
-        hookSpecificOutput: {
-          hookEventName: "PermissionRequest",
-          decision: {
-            behavior: "deny",
-            message: planDenyFeedback(result.feedback || "", "ExitPlanMode"),
+    // Claude Code: PermissionRequest hook decision
+    if (result.approved) {
+      const updatedPermissions = [];
+      if (result.permissionMode) {
+        updatedPermissions.push({
+          type: "setMode",
+          mode: result.permissionMode,
+          destination: "session",
+        });
+      }
+
+      console.log(
+        JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: "PermissionRequest",
+            decision: {
+              behavior: "allow",
+              ...(updatedPermissions.length > 0 && { updatedPermissions }),
+            },
           },
-        },
-      })
-    );
+        })
+      );
+    } else {
+      console.log(
+        JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: "PermissionRequest",
+            decision: {
+              behavior: "deny",
+              message: planDenyFeedback(result.feedback || "", "ExitPlanMode"),
+            },
+          },
+        })
+      );
+    }
   }
 
   process.exit(0);

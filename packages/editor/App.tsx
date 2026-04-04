@@ -97,6 +97,7 @@ const App: React.FC = () => {
   const [isWSL, setIsWSL] = useState(false);
   const [globalAttachments, setGlobalAttachments] = useState<ImageAttachment[]>([]);
   const [annotateMode, setAnnotateMode] = useState(false);
+  const [spawnMode, setSpawnMode] = useState(false);
   const [annotateSource, setAnnotateSource] = useState<'file' | 'message' | 'folder' | null>(null);
   const [imageBaseDir, setImageBaseDir] = useState<string | undefined>(undefined);
   const [isLoading, setIsLoading] = useState(true);
@@ -286,6 +287,95 @@ const App: React.FC = () => {
     archive.clearSelection();
   }, [linkedDocHook, vaultBrowser, fileBrowser, archive]);
 
+  // Derive annotation counts per file from linked doc cache (includes active doc's live state)
+  const allAnnotationCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const [fp, cached] of linkedDocHook.getDocAnnotations()) {
+      const count = cached.annotations.length + cached.globalAttachments.length;
+      if (count > 0) counts.set(fp, count);
+    }
+    return counts;
+  }, [linkedDocHook.getDocAnnotations, annotations, globalAttachments]);
+
+  // FileBrowser counts: only files under file browser directories
+  const fileAnnotationCounts = useMemo(() => {
+    if (fileBrowserDirs.length === 0) return allAnnotationCounts;
+    const counts = new Map<string, number>();
+    for (const [fp, count] of allAnnotationCounts) {
+      if (fileBrowserDirs.some(dir => fp.startsWith(dir + '/'))) {
+        counts.set(fp, count);
+      }
+    }
+    return counts;
+  }, [allAnnotationCounts, fileBrowserDirs]);
+
+  // VaultBrowser uses relative paths — strip vaultPath prefix for lookup
+  const vaultAnnotationCounts = useMemo(() => {
+    if (!vaultPath) return new Map<string, number>();
+    const prefix = vaultPath.endsWith('/') ? vaultPath : vaultPath + '/';
+    const counts = new Map<string, number>();
+    for (const [fp, count] of allAnnotationCounts) {
+      if (fp.startsWith(prefix)) {
+        counts.set(fp.slice(prefix.length), count);
+      }
+    }
+    return counts;
+  }, [allAnnotationCounts, vaultPath]);
+
+  const hasFileAnnotations = fileAnnotationCounts.size > 0;
+  const hasVaultAnnotations = vaultAnnotationCounts.size > 0;
+
+  // Annotations in other files (not the current view) — for the right panel "+N" indicator
+  const otherFileAnnotations = useMemo(() => {
+    const currentFile = linkedDocHook.filepath;
+    let count = 0;
+    let files = 0;
+    for (const [fp, n] of allAnnotationCounts) {
+      if (fp !== currentFile) {
+        count += n;
+        files++;
+      }
+    }
+    return count > 0 ? { count, files } : undefined;
+  }, [allAnnotationCounts, linkedDocHook.filepath]);
+
+  // Flash highlight for annotated files in the sidebar
+  const [highlightedFiles, setHighlightedFiles] = useState<Set<string> | undefined>();
+  const flashTimerRef = React.useRef<ReturnType<typeof setTimeout>>();
+  const handleFlashAnnotatedFiles = React.useCallback(() => {
+    const filePaths = new Set(allAnnotationCounts.keys());
+    if (filePaths.size === 0) return;
+    // Open sidebar to the relevant tab so the flash is visible
+    if (!sidebar.isOpen || (sidebar.activeTab !== 'files' && sidebar.activeTab !== 'vault')) {
+      sidebar.open(hasVaultAnnotations && !hasFileAnnotations ? 'vault' : 'files');
+    }
+    // Cancel any pending clear from a previous flash
+    if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
+    // Clear first so re-triggering restarts the CSS animation
+    setHighlightedFiles(undefined);
+    requestAnimationFrame(() => {
+      setHighlightedFiles(filePaths);
+      flashTimerRef.current = setTimeout(() => setHighlightedFiles(undefined), 1200);
+    });
+  }, [allAnnotationCounts, sidebar, hasVaultAnnotations, hasFileAnnotations]);
+
+  // Derive vault-relative highlighted files for VaultBrowser
+  const vaultHighlightedFiles = useMemo(() => {
+    if (!highlightedFiles || !vaultPath) return undefined;
+    const prefix = vaultPath.endsWith('/') ? vaultPath : vaultPath + '/';
+    const relative = new Set<string>();
+    for (const fp of highlightedFiles) {
+      if (fp.startsWith(prefix)) relative.add(fp.slice(prefix.length));
+    }
+    return relative.size > 0 ? relative : undefined;
+  }, [highlightedFiles, vaultPath]);
+
+  // Context-aware back label for linked doc navigation
+  const backLabel = annotateSource === 'folder' ? 'file list'
+    : annotateSource === 'file' ? 'file'
+    : annotateSource === 'message' ? 'message'
+    : 'plan';
+
   const handleVaultFetchTree = React.useCallback(() => {
     vaultBrowser.fetchTree(vaultPath);
   }, [vaultBrowser, vaultPath]);
@@ -418,7 +508,7 @@ const App: React.FC = () => {
         if (!res.ok) throw new Error('Not in API mode');
         return res.json();
       })
-      .then((data: { plan: string; origin?: Origin; mode?: 'annotate' | 'annotate-last' | 'annotate-folder' | 'archive'; filePath?: string; sharingEnabled?: boolean; shareBaseUrl?: string; pasteApiUrl?: string; repoInfo?: { display: string; branch?: string }; previousPlan?: string | null; versionInfo?: { version: number; totalVersions: number; project: string }; archivePlans?: ArchivedPlan[]; projectRoot?: string; isWSL?: boolean; serverConfig?: { displayName?: string; gitUser?: string } }) => {
+      .then((data: { plan: string; origin?: Origin; mode?: 'annotate' | 'annotate-last' | 'annotate-folder' | 'archive'; filePath?: string; sharingEnabled?: boolean; shareBaseUrl?: string; pasteApiUrl?: string; repoInfo?: { display: string; branch?: string }; previousPlan?: string | null; versionInfo?: { version: number; totalVersions: number; project: string }; archivePlans?: ArchivedPlan[]; projectRoot?: string; isWSL?: boolean; serverConfig?: { displayName?: string; gitUser?: string }; spawn?: boolean }) => {
         // Initialize config store with server-provided values (config file > cookie > default)
         configStore.init(data.serverConfig);
         // gitUser drives the "Use git name" button in Settings; stays undefined (button hidden) when unavailable
@@ -440,6 +530,7 @@ const App: React.FC = () => {
         if (data.mode === 'annotate' || data.mode === 'annotate-last' || data.mode === 'annotate-folder') {
           setAnnotateMode(true);
         }
+        if (data.spawn) setSpawnMode(true);
         if (data.mode === 'annotate-folder') {
           sidebar.open('files');
         }
@@ -1195,13 +1286,17 @@ const App: React.FC = () => {
                   }}
                   disabled={isSubmitting}
                   isLoading={isSubmitting}
-                  label={annotateMode ? (allAnnotations.length > 0 || editorAnnotations.length > 0 || linkedDocHook.docAnnotationCount > 0 ? 'Send Annotations' : 'Done') : 'Send Feedback'}
-                  title={annotateMode ? (allAnnotations.length > 0 || editorAnnotations.length > 0 || linkedDocHook.docAnnotationCount > 0 ? 'Send Annotations' : 'Done') : 'Send Feedback'}
+                  label={spawnMode ? 'Send to Claude' : annotateMode ? (allAnnotations.length > 0 || editorAnnotations.length > 0 || linkedDocHook.docAnnotationCount > 0 ? 'Send Annotations' : 'Done') : 'Send Feedback'}
+                  title={spawnMode ? 'Send to Claude' : annotateMode ? (allAnnotations.length > 0 || editorAnnotations.length > 0 || linkedDocHook.docAnnotationCount > 0 ? 'Send Annotations' : 'Done') : 'Send Feedback'}
                 />
 
-                {!annotateMode && <div className="relative group/approve">
+                {(!annotateMode || spawnMode) && <div className="relative group/approve">
                   <ApproveButton
                     onClick={() => {
+                      if (spawnMode) {
+                        window.close();
+                        return;
+                      }
                       if (origin === 'claude-code' && allAnnotations.length > 0) {
                         setShowClaudeCodeWarning(true);
                         return;
@@ -1218,9 +1313,11 @@ const App: React.FC = () => {
                     }}
                     disabled={isSubmitting}
                     isLoading={isSubmitting}
-                    dimmed={origin === 'claude-code' && allAnnotations.length > 0}
+                    label={spawnMode ? 'Dismiss' : 'Approve'}
+                    loadingLabel={spawnMode ? 'Dismissing...' : 'Approving...'}
+                    dimmed={(origin === 'claude-code' || origin === 'gemini-cli') && allAnnotations.length > 0}
                   />
-                  {origin === 'claude-code' && allAnnotations.length > 0 && (
+                  {(origin === 'claude-code' || origin === 'gemini-cli') && allAnnotations.length > 0 && (
                     <div className="absolute top-full right-0 mt-2 px-3 py-2 bg-popover border border-border rounded-lg shadow-xl text-xs text-foreground w-56 text-center opacity-0 invisible group-hover/approve:opacity-100 group-hover/approve:visible transition-all pointer-events-none z-50">
                       <div className="absolute bottom-full right-4 border-4 border-transparent border-b-border" />
                       <div className="absolute bottom-full right-4 mt-px border-4 border-transparent border-b-popover" />
@@ -1421,6 +1518,8 @@ const App: React.FC = () => {
               hasDiff={planDiff.hasPreviousVersion}
               showFilesTab={showFilesTab && !archive.archiveMode}
               showVaultTab={showVaultTab}
+              hasFileAnnotations={hasFileAnnotations}
+              hasVaultAnnotations={hasVaultAnnotations}
               className="hidden lg:flex"
             />
           )}
@@ -1442,15 +1541,22 @@ const App: React.FC = () => {
                 onTocNavigate={handleTocNavigate}
                 linkedDocFilepath={linkedDocHook.filepath}
                 onLinkedDocBack={linkedDocHook.isActive ? handleLinkedDocBack : undefined}
+                backLabel={backLabel}
                 showFilesTab={showFilesTab && !archive.archiveMode}
+                fileAnnotationCounts={fileAnnotationCounts}
+                highlightedFiles={highlightedFiles}
                 fileBrowser={fileBrowser}
                 onFilesSelectFile={handleFileBrowserSelect}
                 onFilesFetchAll={() => fileBrowser.fetchAll(fileBrowserDirs)}
                 showVaultTab={showVaultTab && !archive.archiveMode}
                 vaultPath={vaultPath}
                 vaultBrowser={vaultBrowser}
+                vaultAnnotationCounts={vaultAnnotationCounts}
+                vaultHighlightedFiles={vaultHighlightedFiles}
                 onVaultSelectFile={handleVaultFileSelect}
                 onVaultFetchTree={handleVaultFetchTree}
+                hasFileAnnotations={hasFileAnnotations}
+                hasVaultAnnotations={hasVaultAnnotations}
                 versionInfo={versionInfo}
                 versions={planDiff.versions}
                 selectedBaseVersion={planDiff.diffBaseVersion}
@@ -1555,7 +1661,7 @@ const App: React.FC = () => {
                   showDemoBadge={!isApiMode && !isLoadingShared && !isSharedSession}
                   maxWidth={planMaxWidth}
                   onOpenLinkedDoc={handleOpenLinkedDoc}
-                  linkedDocInfo={linkedDocHook.isActive ? { filepath: linkedDocHook.filepath!, onBack: handleLinkedDocBack, label: vaultBrowser.activeFile ? 'Vault File' : fileBrowser.activeFile ? 'File' : undefined } : null}
+                  linkedDocInfo={linkedDocHook.isActive ? { filepath: linkedDocHook.filepath!, onBack: handleLinkedDocBack, label: vaultBrowser.activeFile ? 'Vault File' : fileBrowser.activeFile ? 'File' : undefined, backLabel } : null}
                   imageBaseDir={imageBaseDir}
                   copyLabel={annotateSource === 'message' ? 'Copy message' : annotateSource === 'file' || annotateSource === 'folder' ? 'Copy file' : undefined}
                   archiveInfo={archive.currentInfo}
@@ -1587,6 +1693,8 @@ const App: React.FC = () => {
             onQuickCopy={async () => {
               await navigator.clipboard.writeText(wrapFeedbackForAgent(annotationsOutput));
             }}
+            otherFileAnnotations={otherFileAnnotations}
+            onOtherFileAnnotationsClick={handleFlashAnnotatedFiles}
           />
         </div>
 

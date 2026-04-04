@@ -5,20 +5,23 @@ import { EditorAnnotationCard } from '@plannotator/ui/components/EditorAnnotatio
 import { HighlightedCode } from './HighlightedCode';
 import { detectLanguage } from '../utils/detectLanguage';
 import { renderInlineMarkdown } from '../utils/renderInlineMarkdown';
-import { usePRContext } from '../hooks/usePRContext';
 import { formatRelativeTime } from '../utils/formatRelativeTime';
-import { PRSummaryTab } from './PRSummaryTab';
-import { PRCommentsTab } from './PRCommentsTab';
-import { PRChecksTab } from './PRChecksTab';
 import { AITab } from './AITab';
 import { SparklesIcon } from './SparklesIcon';
-import type { PRMetadata } from '@plannotator/shared/pr-provider';
+import { ReviewAgentsIcon } from './ReviewAgentsIcon';
+import { AgentsTab } from '@plannotator/ui/components/AgentsTab';
+import type { PRMetadata, PRContext } from '@plannotator/shared/pr-provider';
 import type { AIChatEntry } from '../hooks/useAIChat';
+import type { AgentJobInfo, AgentCapabilities } from '@plannotator/ui/types';
 import type { DiffFile } from '../types';
 
-type ReviewPanelTab = 'annotations' | 'ai' | 'summary' | 'comments' | 'checks';
+type ReviewSidebarTab = 'annotations' | 'ai' | 'agents';
 
-interface ReviewPanelProps {
+// Temporary hard kill-switch for review agents in the sidebar.
+// Keep local and explicit until the feature is ready to expose again.
+const REVIEW_AGENTS_ENABLED = false;
+
+interface ReviewSidebarProps {
   isOpen: boolean;
   onToggle: () => void;
   annotations: CodeAnnotation[];
@@ -31,14 +34,18 @@ interface ReviewPanelProps {
   editorAnnotations?: EditorAnnotation[];
   onDeleteEditorAnnotation?: (id: string) => void;
   prMetadata?: PRMetadata | null;
+  prContext?: PRContext | null;
+  isPRContextLoading?: boolean;
+  prContextError?: string | null;
+  onFetchPRContext?: () => void;
   // AI props
   aiAvailable?: boolean;
   aiMessages?: AIChatEntry[];
   isAICreatingSession?: boolean;
   isAIStreaming?: boolean;
   onScrollToAILines?: (filePath: string, lineStart: number, lineEnd: number, side: 'old' | 'new') => void;
-  activeTabOverride?: ReviewPanelTab;
-  onTabChange?: (tab: ReviewPanelTab) => void;
+  activeTabOverride?: ReviewSidebarTab;
+  onTabChange?: (tab: ReviewSidebarTab) => void;
   activeFilePath?: string;
   scrollToQuestionId?: string | null;
   onAskGeneral?: (question: string) => void;
@@ -48,6 +55,15 @@ interface ReviewPanelProps {
   aiConfig?: { providerId: string | null; model: string | null; reasoningEffort?: string | null };
   onAIConfigChange?: (config: { providerId?: string | null; model?: string | null; reasoningEffort?: string | null }) => void;
   hasAISession?: boolean;
+  // Agent props
+  agentJobs?: AgentJobInfo[];
+  agentCapabilities?: AgentCapabilities | null;
+  onAgentLaunch?: (params: { provider?: string; command?: string[]; label?: string }) => void;
+  onAgentKillJob?: (id: string) => void;
+  onAgentKillAll?: () => void;
+  externalAnnotations?: Array<{ source?: string }>;
+  onOpenJobDetail?: (jobId: string) => void;
+  onOpenPRPanel?: (type: 'summary' | 'comments' | 'checks') => void;
 }
 
 const SuggestionPreview: React.FC<{ code: string; originalCode?: string; language?: string }> = ({ code, originalCode, language }) => {
@@ -95,30 +111,8 @@ function compareCodeAnnotations(a: CodeAnnotation, b: CodeAnnotation): number {
     : a.lineStart - b.lineStart;
 }
 
-const PR_TABS: { id: ReviewPanelTab; label: string; icon: React.ReactNode }[] = [
-  { id: 'annotations', label: 'Annotations', icon: (
-    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-      <path strokeLinecap="round" strokeLinejoin="round" d="M7 8h10M7 12h4m1 8l-4-4H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-3l-4 4z" />
-    </svg>
-  )},
-  { id: 'summary', label: 'Summary', icon: (
-    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-      <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-    </svg>
-  )},
-  { id: 'comments', label: 'Comments', icon: (
-    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-      <path strokeLinecap="round" strokeLinejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
-    </svg>
-  )},
-  { id: 'checks', label: 'Checks', icon: (
-    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-      <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-    </svg>
-  )},
-];
 
-export const ReviewPanel: React.FC<ReviewPanelProps> = ({
+export const ReviewSidebar: React.FC<ReviewSidebarProps> = ({
   isOpen,
   onToggle,
   annotations,
@@ -131,6 +125,10 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
   editorAnnotations,
   onDeleteEditorAnnotation,
   prMetadata,
+  prContext = null,
+  isPRContextLoading = false,
+  prContextError = null,
+  onFetchPRContext,
   aiAvailable = false,
   aiMessages = [],
   isAICreatingSession = false,
@@ -147,38 +145,41 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
   aiConfig,
   onAIConfigChange,
   hasAISession,
+  agentJobs,
+  agentCapabilities,
+  onAgentLaunch,
+  onAgentKillJob,
+  onAgentKillAll,
+  externalAnnotations,
+  onOpenJobDetail,
+  onOpenPRPanel,
 }) => {
   const totalCount = annotations.length + (editorAnnotations?.length ?? 0);
   const [copied, setCopied] = useState(false);
-  const [activeTab, setActiveTab] = useState<ReviewPanelTab>('annotations');
-  const hasPRTabs = !!prMetadata;
+  const [activeTab, setActiveTab] = useState<ReviewSidebarTab>('annotations');
+  const hasAgents = REVIEW_AGENTS_ENABLED && !!agentCapabilities?.available;
+  const runningAgentCount = (agentJobs ?? []).filter(j => j.status === 'running' || j.status === 'starting').length;
 
   // Allow parent to control the active tab (e.g., switch to AI tab on ask)
   useEffect(() => {
-    if (activeTabOverride) setActiveTab(activeTabOverride);
+    if (!activeTabOverride) return;
+    if (activeTabOverride === 'agents' && !REVIEW_AGENTS_ENABLED) {
+      setActiveTab('annotations');
+      return;
+    }
+    setActiveTab(activeTabOverride);
   }, [activeTabOverride]);
 
-  const { prContext, isLoading: isPRContextLoading, error: prContextError, fetchContext } = usePRContext(prMetadata ?? null);
-
-  // Fetch PR context on first click of a PR tab
-  const handleTabChange = (tab: ReviewPanelTab) => {
+  const handleTabChange = (tab: ReviewSidebarTab | 'summary' | 'comments' | 'checks') => {
+    // PR tabs open as center dock panels instead of rendering in the sidebar
+    if (tab === 'summary' || tab === 'comments' || tab === 'checks') {
+      onOpenPRPanel?.(tab);
+      return;
+    }
+    if (tab === 'agents' && !REVIEW_AGENTS_ENABLED) return;
     setActiveTab(tab);
     onTabChange?.(tab);
-    if (tab !== 'annotations' && tab !== 'ai' && !prContext && !isPRContextLoading) {
-      fetchContext();
-    }
   };
-
-  // Small status dot for checks tab
-  const checksStatusDot = prContext
-    ? prContext.checks.some(c => c.conclusion === 'FAILURE' || c.conclusion === 'TIMED_OUT')
-      ? 'bg-destructive'
-      : prContext.checks.some(c => c.status !== 'COMPLETED')
-        ? 'bg-yellow-500'
-        : prContext.checks.length > 0
-          ? 'bg-success'
-          : null
-    : null;
 
   const handleQuickCopy = async () => {
     if (!feedbackMarkdown) return;
@@ -213,11 +214,16 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
         <div className="px-3 flex items-center border-b border-border/50" style={{ height: 'var(--panel-header-h)' }}>
           <div className="flex items-center gap-2 w-full">
             <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-              {activeTab === 'annotations' ? 'Annotations' : activeTab === 'ai' ? 'AI' : activeTab === 'summary' ? 'Summary' : activeTab === 'comments' ? 'Comments' : 'Checks'}
+              {activeTab === 'annotations' ? 'Annotations' : activeTab === 'ai' ? 'AI' : activeTab === 'agents' ? 'Review Agents' : activeTab === 'summary' ? 'Summary' : activeTab === 'comments' ? 'Comments' : 'Checks'}
             </h2>
             {activeTab === 'annotations' && totalCount > 0 && (
               <span className="text-[10px] font-mono bg-muted px-1.5 py-0.5 rounded text-muted-foreground">
                 {totalCount}
+              </span>
+            )}
+            {activeTab === 'agents' && (agentJobs?.length ?? 0) > 0 && (
+              <span className="text-[10px] font-mono bg-muted px-1.5 py-0.5 rounded text-muted-foreground">
+                {agentJobs!.length}
               </span>
             )}
             {activeTab === 'ai' && aiMessages.length > 0 && (
@@ -260,24 +266,56 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
                 </button>
               )}
 
-              {/* PR tabs (only in PR mode) */}
-              {hasPRTabs && PR_TABS.filter(t => t.id !== 'annotations').map((tab) => (
+              {/* Agents tab (visible when agent capabilities available) */}
+              {hasAgents && (
                 <button
-                  key={tab.id}
-                  onClick={() => handleTabChange(tab.id)}
-                  className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors ${
-                    activeTab === tab.id
+                  onClick={() => handleTabChange('agents')}
+                  className={`relative flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors ${
+                    activeTab === 'agents'
                       ? 'bg-primary/10 text-primary'
                       : 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
                   }`}
-                  title={tab.label}
+                  title="Review Agents"
                 >
-                  {tab.icon}
-                  {tab.id === 'checks' && checksStatusDot && (
-                    <span className={`w-1.5 h-1.5 rounded-full ${checksStatusDot}`} />
+                  <ReviewAgentsIcon />
+                  {runningAgentCount > 0 && activeTab !== 'agents' && (
+                    <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-primary animate-pulse" />
                   )}
                 </button>
-              ))}
+              )}
+
+              {/* PR tabs — open as center dock panels */}
+              {!!prMetadata && (
+                <>
+                  <button
+                    onClick={() => handleTabChange('summary')}
+                    className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors text-muted-foreground hover:text-foreground hover:bg-muted/50"
+                    title="PR Summary"
+                  >
+                    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                    </svg>
+                  </button>
+                  <button
+                    onClick={() => handleTabChange('comments')}
+                    className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors text-muted-foreground hover:text-foreground hover:bg-muted/50"
+                    title="PR Comments"
+                  >
+                    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+                    </svg>
+                  </button>
+                  <button
+                    onClick={() => handleTabChange('checks')}
+                    className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors text-muted-foreground hover:text-foreground hover:bg-muted/50"
+                    title="PR Checks"
+                  >
+                    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                  </button>
+                </>
+              )}
             </div>
           </div>
         </div>
@@ -415,34 +453,19 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
             />
           )}
 
-          {/* PR tabs — loading / error / content */}
-          {activeTab !== 'annotations' && activeTab !== 'ai' && (
-            <>
-              {isPRContextLoading && (
-                <div className="flex items-center justify-center h-40">
-                  <div className="text-xs text-muted-foreground">Loading...</div>
-                </div>
-              )}
-              {prContextError && (
-                <div className="p-4 text-center">
-                  <p className="text-xs text-destructive">{prContextError}</p>
-                  <button
-                    onClick={() => fetchContext()}
-                    className="mt-2 text-xs text-primary hover:underline"
-                  >
-                    Retry
-                  </button>
-                </div>
-              )}
-              {prContext && prMetadata && (
-                <>
-                  {activeTab === 'summary' && <PRSummaryTab context={prContext} metadata={prMetadata} />}
-                  {activeTab === 'comments' && <PRCommentsTab context={prContext} />}
-                  {activeTab === 'checks' && <PRChecksTab context={prContext} />}
-                </>
-              )}
-            </>
+          {/* Agents tab */}
+          {activeTab === 'agents' && (
+            <AgentsTab
+              jobs={agentJobs ?? []}
+              capabilities={agentCapabilities ?? null}
+              onLaunch={onAgentLaunch ?? (() => {})}
+              onKillJob={onAgentKillJob ?? (() => {})}
+              onKillAll={onAgentKillAll ?? (() => {})}
+              externalAnnotations={externalAnnotations ?? []}
+              onOpenJobDetail={onOpenJobDetail}
+            />
           )}
+
         </div>
 
         {/* Quick Copy Footer — annotations tab only */}

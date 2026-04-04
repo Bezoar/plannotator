@@ -11,12 +11,13 @@
 
 import { isRemoteSession, getServerPort } from "./remote";
 import type { Origin } from "@plannotator/shared/agents";
-import { type DiffType, type GitContext, runGitDiff, getFileContentsForDiff, gitAddFile, gitResetFile, parseWorktreeDiffType, validateFilePath } from "./git";
+import { type DiffType, type GitContext, runVcsDiff, getVcsFileContentsForDiff, canStageFiles, stageFile, unstageFile, resolveVcsCwd, validateFilePath } from "./vcs";
 import { getRepoInfo } from "./repo";
 import { handleImage, handleUpload, handleAgents, handleServerReady, handleDraftSave, handleDraftLoad, handleDraftDelete, handleFavicon, type OpencodeClient } from "./shared-handlers";
 import { contentHash, deleteDraft } from "./draft";
 import { createEditorAnnotationHandler } from "./editor-annotations";
 import { createExternalAnnotationHandler } from "./external-annotations";
+import { createAgentJobHandler } from "./agent-jobs";
 import { saveConfig, detectGitUser, getServerConfig } from "./config";
 import { type PRMetadata, type PRReviewFileComment, fetchPRFileContent, fetchPRContext, submitPRReview, fetchPRViewedFiles, markPRFilesViewed, getPRUser, prRefFromMetadata, getDisplayRepo, getMRLabel, getMRNumberLabel } from "./pr";
 import { createAIEndpoints, ProviderRegistry, SessionManager, createProvider, type AIEndpoints, type PiSDKConfig } from "@plannotator/ai";
@@ -25,7 +26,7 @@ import { isWSL } from "./browser";
 // Re-export utilities
 export { isRemoteSession, getServerPort } from "./remote";
 export { openBrowser } from "./browser";
-export { type DiffType, type DiffOption, type GitContext, type WorktreeInfo } from "./git";
+export { type DiffType, type DiffOption, type GitContext, type WorktreeInfo } from "./vcs";
 export { type PRMetadata } from "./pr";
 export { handleServerReady as handleReviewServerReady } from "./shared-handlers";
 
@@ -56,6 +57,8 @@ export interface ReviewServerOptions {
   opencodeClient?: OpencodeClient;
   /** PR metadata when reviewing a pull request (PR mode) */
   prMetadata?: PRMetadata;
+  /** Whether the UI is in standalone spawn mode (changes button labels) */
+  spawn?: boolean;
 }
 
 export interface ReviewServerResult {
@@ -92,7 +95,7 @@ const RETRY_DELAY_MS = 500;
 export async function startReviewServer(
   options: ReviewServerOptions
 ): Promise<ReviewServerResult> {
-  const { htmlContent, origin, gitContext, sharingEnabled = true, shareBaseUrl, onReady, prMetadata } = options;
+  const { htmlContent, origin, gitContext, sharingEnabled = true, shareBaseUrl, onReady, prMetadata, spawn } = options;
 
   const isPRMode = !!prMetadata;
   const draftKey = contentHash(options.rawPatch);
@@ -104,6 +107,16 @@ export async function startReviewServer(
   let currentGitRef = options.gitRef;
   let currentDiffType: DiffType = options.diffType || "uncommitted";
   let currentError = options.error;
+
+  // Agent jobs — background process manager (late-binds serverUrl via getter)
+  let serverUrl = "";
+  const agentJobs = createAgentJobHandler({
+    mode: "review",
+    getServerUrl: () => serverUrl,
+    getCwd: () => {
+      return resolveVcsCwd(currentDiffType, gitContext?.cwd) ?? process.cwd();
+    },
+  });
 
   // AI provider setup (graceful — AI features degrade if SDK unavailable)
   const aiRegistry = new ProviderRegistry();
@@ -183,11 +196,7 @@ export async function startReviewServer(
       registry: aiRegistry,
       sessionManager: aiSessionManager,
       getCwd: () => {
-        if (currentDiffType.startsWith("worktree:")) {
-          const parsed = parseWorktreeDiffType(currentDiffType);
-          if (parsed) return parsed.path;
-        }
-        return gitContext?.cwd ?? process.cwd();
+        return resolveVcsCwd(currentDiffType, gitContext?.cwd) ?? process.cwd();
       },
     });
   }
@@ -210,17 +219,13 @@ export async function startReviewServer(
   // Fetch GitHub viewed file state (non-blocking — errors are silently ignored)
   let initialViewedFiles: string[] = [];
   if (isPRMode && prRef) {
-    console.log("[plannotator] Fetching PR viewed files for", prRef);
     try {
       const viewedMap = await fetchPRViewedFiles(prRef);
-      console.log("[plannotator] PR viewed files map:", viewedMap);
       initialViewedFiles = Object.entries(viewedMap)
         .filter(([, isViewed]) => isViewed)
         .map(([path]) => path);
-      console.log("[plannotator] Initial viewed files:", initialViewedFiles);
-    } catch (err) {
+    } catch {
       // Non-fatal: viewed state is best-effort
-      console.warn("[plannotator] Could not fetch PR viewed files:", err instanceof Error ? err.message : err);
     }
   }
 
@@ -267,6 +272,7 @@ export async function startReviewServer(
               ...(isPRMode && initialViewedFiles.length > 0 && { viewedFiles: initialViewedFiles }),
               ...(currentError && { error: currentError }),
               serverConfig: getServerConfig(gitUser),
+              spawn,
             });
           }
 
@@ -293,7 +299,7 @@ export async function startReviewServer(
               const defaultCwd = gitContext?.cwd;
 
               // Run the new diff
-              const result = await runGitDiff(newDiffType, defaultBranch, defaultCwd);
+              const result = await runVcsDiff(newDiffType, defaultBranch, defaultCwd);
 
               // Update state
               currentPatch = result.patch;
@@ -359,7 +365,7 @@ export async function startReviewServer(
 
             const defaultBranch = gitContext?.defaultBranch || "main";
             const defaultCwd = gitContext?.cwd;
-            const result = await getFileContentsForDiff(
+            const result = await getVcsFileContentsForDiff(
               currentDiffType,
               defaultBranch,
               filePath,
@@ -369,11 +375,11 @@ export async function startReviewServer(
             return Response.json(result);
           }
 
-          // API: Git add / reset (stage / unstage) a file (disabled in PR mode)
+          // API: Stage / unstage a file (disabled when VCS doesn't support it)
           if (url.pathname === "/api/git-add" && req.method === "POST") {
-            if (isPRMode) {
+            if (isPRMode || !canStageFiles(currentDiffType)) {
               return Response.json(
-                { error: "Not available for PR reviews" },
+                { error: "Staging not available" },
                 { status: 400 },
               );
             }
@@ -383,25 +389,17 @@ export async function startReviewServer(
                 return Response.json({ error: "Missing filePath" }, { status: 400 });
               }
 
-              // Determine cwd for worktree support
-              let cwd: string | undefined;
-              if (currentDiffType.startsWith("worktree:")) {
-                const parsed = parseWorktreeDiffType(currentDiffType);
-                if (parsed) cwd = parsed.path;
-              }
-              if (!cwd) {
-                cwd = gitContext?.cwd;
-              }
+              const cwd = resolveVcsCwd(currentDiffType, gitContext?.cwd);
 
               if (body.undo) {
-                await gitResetFile(body.filePath, cwd);
+                await unstageFile(currentDiffType, body.filePath, cwd);
               } else {
-                await gitAddFile(body.filePath, cwd);
+                await stageFile(currentDiffType, body.filePath, cwd);
               }
 
               return Response.json({ ok: true });
             } catch (err) {
-              const message = err instanceof Error ? err.message : "Failed to git add";
+              const message = err instanceof Error ? err.message : "Failed to stage file";
               return Response.json({ error: message }, { status: 500 });
             }
           }
@@ -451,6 +449,12 @@ export async function startReviewServer(
             disableIdleTimeout: () => server.timeout(req, 0),
           });
           if (externalResponse) return externalResponse;
+
+          // API: Agent jobs (background review agents)
+          const agentResponse = await agentJobs.handle(req, url, {
+            disableIdleTimeout: () => server.timeout(req, 0),
+          });
+          if (agentResponse) return agentResponse;
 
           // API: Submit review feedback
           if (url.pathname === "/api/feedback" && req.method === "POST") {
@@ -509,16 +513,13 @@ export async function startReviewServer(
           // API: Mark/unmark PR files as viewed on GitHub (PR mode, GitHub only)
           if (url.pathname === "/api/pr-viewed" && req.method === "POST") {
             if (!isPRMode || !prMetadata) {
-              console.log("[plannotator] /api/pr-viewed: not in PR mode");
               return Response.json({ error: "Not in PR mode" }, { status: 400 });
             }
             if (prMetadata.platform !== "github") {
-              console.log("[plannotator] /api/pr-viewed: platform is", prMetadata.platform, "(not github)");
               return Response.json({ error: "Viewed sync only supported for GitHub" }, { status: 400 });
             }
             const prNodeId = prMetadata.prNodeId;
             if (!prNodeId) {
-              console.log("[plannotator] /api/pr-viewed: prNodeId missing from metadata:", prMetadata);
               return Response.json({ error: "PR node ID not available" }, { status: 400 });
             }
             try {
@@ -526,9 +527,7 @@ export async function startReviewServer(
                 filePaths: string[];
                 viewed: boolean;
               };
-              console.log("[plannotator] /api/pr-viewed: marking", body.filePaths, "as viewed=", body.viewed, "prNodeId=", prNodeId);
               await markPRFilesViewed(prRef!, prNodeId, body.filePaths, body.viewed);
-              console.log("[plannotator] /api/pr-viewed: success");
               return Response.json({ ok: true });
             } catch (err) {
               const message =
@@ -579,7 +578,9 @@ export async function startReviewServer(
   }
 
   const port = server.port!;
-  const serverUrl = `http://localhost:${port}`;
+  serverUrl = `http://localhost:${port}`;
+  const exitHandler = () => agentJobs.killAll();
+  process.once("exit", exitHandler);
 
   // Notify caller that server is ready
   if (onReady) {
@@ -592,6 +593,9 @@ export async function startReviewServer(
     isRemote,
     waitForDecision: () => decisionPromise,
     stop: () => {
+      process.removeListener("exit", exitHandler);
+      agentJobs.killAll();
+      externalAnnotations?.dispose();
       aiSessionManager.disposeAll();
       aiRegistry.disposeAll();
       server.stop();
