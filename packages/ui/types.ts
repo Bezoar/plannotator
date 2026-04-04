@@ -76,6 +76,14 @@ export interface CodeAnnotation {
   createdAt: number;
   author?: string;
   source?: string; // External tool identifier (e.g., "eslint") — set when annotation comes from external API
+  /** PR comment this annotation responds to */
+  prComment?: {
+    id: number;
+    author: string;
+    body: string;
+    path?: string;
+    line?: number;
+  };
 }
 
 // For @pierre/diffs integration
@@ -87,11 +95,13 @@ export interface DiffAnnotationMetadata {
   originalCode?: string;
   author?: string;
   // AI marker fields (set when kind === 'ai-marker')
-  kind?: 'annotation' | 'ai-marker';
+  kind?: 'annotation' | 'ai-marker' | 'pr-comment';
   questionId?: string;
   promptPreview?: string;
   hasResponse?: boolean;
   isStreaming?: boolean;
+  // PR inline comment fields (set when kind === 'pr-comment')
+  prComment?: import('@plannotator/shared/pr-provider').PRInlineComment;
 }
 
 export interface SelectedLineRange {

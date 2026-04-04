@@ -97,6 +97,7 @@ const App: React.FC = () => {
   const [isWSL, setIsWSL] = useState(false);
   const [globalAttachments, setGlobalAttachments] = useState<ImageAttachment[]>([]);
   const [annotateMode, setAnnotateMode] = useState(false);
+  const [spawnMode, setSpawnMode] = useState(false);
   const [annotateSource, setAnnotateSource] = useState<'file' | 'message' | 'folder' | null>(null);
   const [imageBaseDir, setImageBaseDir] = useState<string | undefined>(undefined);
   const [isLoading, setIsLoading] = useState(true);
@@ -507,7 +508,7 @@ const App: React.FC = () => {
         if (!res.ok) throw new Error('Not in API mode');
         return res.json();
       })
-      .then((data: { plan: string; origin?: Origin; mode?: 'annotate' | 'annotate-last' | 'annotate-folder' | 'archive'; filePath?: string; sharingEnabled?: boolean; shareBaseUrl?: string; pasteApiUrl?: string; repoInfo?: { display: string; branch?: string }; previousPlan?: string | null; versionInfo?: { version: number; totalVersions: number; project: string }; archivePlans?: ArchivedPlan[]; projectRoot?: string; isWSL?: boolean; serverConfig?: { displayName?: string; gitUser?: string } }) => {
+      .then((data: { plan: string; origin?: Origin; mode?: 'annotate' | 'annotate-last' | 'annotate-folder' | 'archive'; filePath?: string; sharingEnabled?: boolean; shareBaseUrl?: string; pasteApiUrl?: string; repoInfo?: { display: string; branch?: string }; previousPlan?: string | null; versionInfo?: { version: number; totalVersions: number; project: string }; archivePlans?: ArchivedPlan[]; projectRoot?: string; isWSL?: boolean; serverConfig?: { displayName?: string; gitUser?: string }; spawn?: boolean }) => {
         // Initialize config store with server-provided values (config file > cookie > default)
         configStore.init(data.serverConfig);
         // gitUser drives the "Use git name" button in Settings; stays undefined (button hidden) when unavailable
@@ -529,6 +530,7 @@ const App: React.FC = () => {
         if (data.mode === 'annotate' || data.mode === 'annotate-last' || data.mode === 'annotate-folder') {
           setAnnotateMode(true);
         }
+        if (data.spawn) setSpawnMode(true);
         if (data.mode === 'annotate-folder') {
           sidebar.open('files');
         }
@@ -1284,13 +1286,17 @@ const App: React.FC = () => {
                   }}
                   disabled={isSubmitting}
                   isLoading={isSubmitting}
-                  label={annotateMode ? (allAnnotations.length > 0 || editorAnnotations.length > 0 || linkedDocHook.docAnnotationCount > 0 ? 'Send Annotations' : 'Done') : 'Send Feedback'}
-                  title={annotateMode ? (allAnnotations.length > 0 || editorAnnotations.length > 0 || linkedDocHook.docAnnotationCount > 0 ? 'Send Annotations' : 'Done') : 'Send Feedback'}
+                  label={spawnMode ? 'Send to Claude' : annotateMode ? (allAnnotations.length > 0 || editorAnnotations.length > 0 || linkedDocHook.docAnnotationCount > 0 ? 'Send Annotations' : 'Done') : 'Send Feedback'}
+                  title={spawnMode ? 'Send to Claude' : annotateMode ? (allAnnotations.length > 0 || editorAnnotations.length > 0 || linkedDocHook.docAnnotationCount > 0 ? 'Send Annotations' : 'Done') : 'Send Feedback'}
                 />
 
-                {!annotateMode && <div className="relative group/approve">
+                {(!annotateMode || spawnMode) && <div className="relative group/approve">
                   <ApproveButton
                     onClick={() => {
+                      if (spawnMode) {
+                        window.close();
+                        return;
+                      }
                       if (origin === 'claude-code' && allAnnotations.length > 0) {
                         setShowClaudeCodeWarning(true);
                         return;
@@ -1307,6 +1313,8 @@ const App: React.FC = () => {
                     }}
                     disabled={isSubmitting}
                     isLoading={isSubmitting}
+                    label={spawnMode ? 'Dismiss' : 'Approve'}
+                    loadingLabel={spawnMode ? 'Dismissing...' : 'Approving...'}
                     dimmed={(origin === 'claude-code' || origin === 'gemini-cli') && allAnnotations.length > 0}
                   />
                   {(origin === 'claude-code' || origin === 'gemini-cli') && allAnnotations.length > 0 && (

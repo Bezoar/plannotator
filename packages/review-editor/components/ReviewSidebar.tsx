@@ -10,7 +10,7 @@ import { AITab } from './AITab';
 import { SparklesIcon } from './SparklesIcon';
 import { ReviewAgentsIcon } from './ReviewAgentsIcon';
 import { AgentsTab } from '@plannotator/ui/components/AgentsTab';
-import type { PRMetadata } from '@plannotator/shared/pr-provider';
+import type { PRMetadata, PRContext } from '@plannotator/shared/pr-provider';
 import type { AIChatEntry } from '../hooks/useAIChat';
 import type { AgentJobInfo, AgentCapabilities } from '@plannotator/ui/types';
 import type { DiffFile } from '../types';
@@ -34,6 +34,10 @@ interface ReviewSidebarProps {
   editorAnnotations?: EditorAnnotation[];
   onDeleteEditorAnnotation?: (id: string) => void;
   prMetadata?: PRMetadata | null;
+  prContext?: PRContext | null;
+  isPRContextLoading?: boolean;
+  prContextError?: string | null;
+  onFetchPRContext?: () => void;
   // AI props
   aiAvailable?: boolean;
   aiMessages?: AIChatEntry[];
@@ -121,6 +125,10 @@ export const ReviewSidebar: React.FC<ReviewSidebarProps> = ({
   editorAnnotations,
   onDeleteEditorAnnotation,
   prMetadata,
+  prContext = null,
+  isPRContextLoading = false,
+  prContextError = null,
+  onFetchPRContext,
   aiAvailable = false,
   aiMessages = [],
   isAICreatingSession = false,

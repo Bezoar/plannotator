@@ -95,6 +95,7 @@ import {
   isTopLevelHelpInvocation,
 } from "./cli";
 import path from "path";
+import { isSpawnMode, spawnClaudeSession } from "@plannotator/server/spawn";
 
 // Embed the built HTML at compile time
 // @ts-ignore - Bun import attribute for text
@@ -114,6 +115,12 @@ if (browserIdx !== -1 && args[browserIdx + 1]) {
   process.env.PLANNOTATOR_BROWSER = args[browserIdx + 1];
   args.splice(browserIdx, 2);
 }
+
+// Global flag: --spawn (or PLANNOTATOR_SPAWN env var)
+const spawnFlag = isSpawnMode();
+// Remove --spawn from args so it doesn't confuse subcommand routing
+const spawnIdx = args.indexOf("--spawn");
+if (spawnIdx !== -1) args.splice(spawnIdx, 1);
 
 if (isTopLevelHelpInvocation(args)) {
   console.log(formatTopLevelHelp());
@@ -154,6 +161,7 @@ const detectedOrigin: Origin =
 async function runAnnotateFlow(
   filePath: string,
   projectRoot: string,
+  spawn?: boolean,
 ): Promise<string> {
   // Strip @ prefix if present (Claude Code file reference syntax)
   if (filePath.startsWith("@")) {
@@ -217,6 +225,7 @@ async function runAnnotateFlow(
     sharingEnabled,
     shareBaseUrl,
     pasteApiUrl,
+    spawn,
     htmlContent: planHtmlContent,
     onReady: async (url, isRemote, port) => {
       handleAnnotateServerReady(url, isRemote, port);
@@ -261,6 +270,7 @@ async function runAnnotateFlow(
 async function runReviewFlow(
   reviewArg: string | undefined,
   projectRoot: string,
+  spawn?: boolean,
 ): Promise<string> {
   const isPRMode =
     reviewArg?.startsWith("http://") || reviewArg?.startsWith("https://");
@@ -331,6 +341,7 @@ async function runReviewFlow(
     prMetadata,
     sharingEnabled,
     shareBaseUrl,
+    spawn,
     htmlContent: reviewHtmlContent,
     onReady: async (url, isRemote, port) => {
       handleReviewServerReady(url, isRemote, port);
@@ -427,7 +438,18 @@ if (args[0] === "sessions") {
   const projectRoot = process.env.PLANNOTATOR_CWD || process.cwd();
 
   try {
-    const feedback = await runReviewFlow(args[1], projectRoot);
+    const feedback = await runReviewFlow(args[1], projectRoot, spawnFlag);
+
+    if (spawnFlag && feedback) {
+      const prompt = [
+        "# Code Review Feedback\n",
+        feedback,
+        "\n\nPlease address the review feedback above.",
+      ].join("\n");
+      const exitCode = await spawnClaudeSession(projectRoot, prompt);
+      process.exit(exitCode);
+    }
+
     console.log(feedback);
   } catch (err) {
     console.error(err instanceof Error ? err.message : String(err));
@@ -449,12 +471,144 @@ if (args[0] === "sessions") {
   const projectRoot = process.env.PLANNOTATOR_CWD || process.cwd();
 
   try {
-    const feedback = await runAnnotateFlow(filePath, projectRoot);
+    const feedback = await runAnnotateFlow(filePath, projectRoot, spawnFlag);
+
+    if (spawnFlag && feedback) {
+      const prompt = [
+        "# Annotation Feedback\n",
+        feedback,
+        "\n\nPlease address the annotations above.",
+      ].join("\n");
+      const exitCode = await spawnClaudeSession(projectRoot, prompt);
+      process.exit(exitCode);
+    }
+
     console.log(feedback);
   } catch (err) {
     console.error(err instanceof Error ? err.message : String(err));
     process.exit(1);
   }
+  process.exit(0);
+
+} else if (args[0] === "plan") {
+  // ============================================
+  // STANDALONE PLAN REVIEW MODE
+  // ============================================
+  // Opens plan review UI with content from a file, archive, or stdin.
+  // With --spawn / PLANNOTATOR_SPAWN: spawns a new `claude` session with feedback.
+
+  const projectRoot = process.env.PLANNOTATOR_CWD || process.cwd();
+  const planProject = (await detectProjectName()) ?? "_unknown";
+
+  let planContent = "";
+
+  if (args.includes("--archive")) {
+    // Archive mode: open archive browser, user picks a plan
+    const server = await startPlannotatorServer({
+      plan: "",
+      origin: detectedOrigin,
+      mode: "archive",
+      sharingEnabled,
+      shareBaseUrl,
+      spawn: spawnFlag,
+      htmlContent: planHtmlContent,
+      onReady: (url, isRemote, port) => {
+        handleServerReady(url, isRemote, port);
+      },
+    });
+
+    registerSession({
+      pid: process.pid,
+      port: server.port,
+      url: server.url,
+      mode: "archive",
+      project: planProject,
+      startedAt: new Date().toISOString(),
+      label: `plan-archive-${planProject}`,
+    });
+
+    await server.waitForDone!();
+    await Bun.sleep(500);
+    server.stop();
+    process.exit(0);
+  }
+
+  // Determine plan source: file path or stdin (-)
+  const source = args[1];
+  if (!source) {
+    console.error("Usage: plannotator plan <file.md | --archive | ->");
+    process.exit(1);
+  }
+
+  if (source === "-") {
+    // Read from stdin
+    planContent = await Bun.stdin.text();
+  } else {
+    // Read from file
+    const { resolve } = await import("node:path");
+    const filePath = resolve(projectRoot, source);
+    try {
+      planContent = await Bun.file(filePath).text();
+    } catch {
+      console.error(`Cannot read file: ${filePath}`);
+      process.exit(1);
+    }
+  }
+
+  if (!planContent.trim()) {
+    console.error("Empty plan content");
+    process.exit(1);
+  }
+
+  // Start the plan review server
+  const server = await startPlannotatorServer({
+    plan: planContent,
+    origin: detectedOrigin,
+    sharingEnabled,
+    shareBaseUrl,
+    pasteApiUrl,
+    spawn: spawnFlag,
+    htmlContent: planHtmlContent,
+    onReady: (url, isRemote, port) => {
+      handleServerReady(url, isRemote, port);
+    },
+  });
+
+  registerSession({
+    pid: process.pid,
+    port: server.port,
+    url: server.url,
+    mode: "plan",
+    project: planProject,
+    startedAt: new Date().toISOString(),
+    label: `plan-${planProject}`,
+  });
+
+  const result = await server.waitForDecision();
+  await Bun.sleep(1500);
+  server.stop();
+
+  if (spawnFlag && !result.approved && result.feedback) {
+    // Spawn mode: launch claude with the plan + feedback
+    const prompt = [
+      "# Plan Review Feedback\n",
+      "## Original Plan\n",
+      planContent,
+      "\n\n## Reviewer Feedback\n",
+      result.feedback,
+      "\n\nPlease address the feedback in the annotations above.",
+    ].join("\n");
+
+    const exitCode = await spawnClaudeSession(projectRoot, prompt);
+    process.exit(exitCode);
+  } else if (spawnFlag && result.approved) {
+    // Dismiss — no action
+    process.exit(0);
+  } else if (result.feedback) {
+    // Non-spawn mode: print feedback to stdout
+    console.log(result.feedback);
+  }
+
   process.exit(0);
 
 } else if (args[0] === "annotate-hook") {

@@ -4,7 +4,7 @@ import type { AgentJobInfo } from '@plannotator/ui/types';
 import type { DiffFile } from '../types';
 import type { AIChatEntry } from '../hooks/useAIChat';
 import type { ReviewSearchMatch } from '../utils/reviewSearch';
-import type { PRMetadata, PRContext } from '@plannotator/shared/pr-provider';
+import type { PRMetadata, PRContext, PRInlineComment } from '@plannotator/shared/pr-provider';
 
 /**
  * Shared review state consumed by dockview panel wrappers.
@@ -74,6 +74,10 @@ export interface ReviewState {
   isPRContextLoading: boolean;
   prContextError: string | null;
   fetchPRContext: () => void;
+
+  // PR inline comments
+  prInlineComments: PRInlineComment[];
+  onRespondToPRComment: (commentId: number, response: string) => void;
 
   // Diff navigation
   openDiffFile: (filePath: string) => void;

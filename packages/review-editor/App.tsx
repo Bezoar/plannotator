@@ -22,6 +22,7 @@ import { CodeAnnotation, CodeAnnotationType, SelectedLineRange } from '@plannota
 import { useResizablePanel } from '@plannotator/ui/hooks/useResizablePanel';
 import { useCodeAnnotationDraft } from '@plannotator/ui/hooks/useCodeAnnotationDraft';
 import { useGitAdd } from './hooks/useGitAdd';
+import { usePRContext } from './hooks/usePRContext';
 import { generateId } from './utils/generateId';
 import { useAIChat } from './hooks/useAIChat';
 import { extractLinesFromPatch } from './utils/patchParser';
@@ -158,6 +159,7 @@ const ReviewApp: React.FC = () => {
   const [submitted, setSubmitted] = useState<'approved' | 'feedback' | false>(false);
   const [showApproveWarning, setShowApproveWarning] = useState(false);
   const [sharingEnabled, setSharingEnabled] = useState(true);
+  const [spawnMode, setSpawnMode] = useState(false);
   const [repoInfo, setRepoInfo] = useState<{ display: string; branch?: string } | null>(null);
 
   useEffect(() => {
@@ -199,6 +201,50 @@ const ReviewApp: React.FC = () => {
   const appVersion = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '0.0.0';
 
   const identity = useConfigValue('displayName');
+
+  // PR context (inline comments, checks, reviews, etc.) — lifted from ReviewPanel
+  // so inline comments can flow to DiffViewer too
+  const { prContext, isLoading: isPRContextLoading, error: prContextError, fetchContext: fetchPRContext } = usePRContext(prMetadata);
+
+  // Eagerly fetch PR context when PR metadata is available so inline comments
+  // appear in the diff without requiring the user to click a sidebar tab first
+  useEffect(() => {
+    if (prMetadata) fetchPRContext();
+  }, [prMetadata, fetchPRContext]);
+
+  // Inline comments for the active file
+  const activeFilePRComments = useMemo(() => {
+    const activeFile = files[activeFileIndex];
+    if (!activeFile || !prContext?.inlineComments) return [];
+    return prContext.inlineComments.filter(c => c.path === activeFile.path);
+  }, [files, activeFileIndex, prContext?.inlineComments]);
+
+  // Handle responding to a PR inline comment by creating a CodeAnnotation
+  const handleRespondToPRComment = useCallback((commentId: number, response: string) => {
+    const comment = prContext?.inlineComments?.find(c => c.id === commentId);
+    if (!comment) return;
+
+    const newAnnotation: CodeAnnotation = {
+      id: generateId(),
+      type: 'comment',
+      filePath: comment.path,
+      lineStart: comment.line ?? 0,
+      lineEnd: comment.line ?? 0,
+      side: comment.side === 'LEFT' ? 'old' : 'new',
+      text: response,
+      createdAt: Date.now(),
+      author: identity,
+      prComment: {
+        id: comment.id,
+        author: comment.author,
+        body: comment.body,
+        path: comment.path,
+        line: comment.line ?? undefined,
+      },
+    };
+
+    setAnnotations(prev => [...prev, newAnnotation]);
+  }, [prContext?.inlineComments, identity]);
 
   const clearPendingSelection = useCallback(() => {
     setPendingSelection(null);
@@ -625,6 +671,7 @@ const ReviewApp: React.FC = () => {
         error?: string;
         isWSL?: boolean;
         serverConfig?: { displayName?: string; gitUser?: string };
+        spawn?: boolean;
       }) => {
         // Initialize config store with server-provided values (config file > cookie > default)
         configStore.init(data.serverConfig);
@@ -654,6 +701,7 @@ const ReviewApp: React.FC = () => {
         }
         if (data.error) setDiffError(data.error);
         if (data.isWSL) setIsWSL(true);
+        if (data.spawn) setSpawnMode(true);
       })
       .catch(() => {
         // Not in API mode - use demo content
@@ -970,6 +1018,8 @@ const ReviewApp: React.FC = () => {
     isPRContextLoading,
     prContextError,
     fetchPRContext,
+    prInlineComments: activeFilePRComments,
+    onRespondToPRComment: handleRespondToPRComment,
     openDiffFile,
   }), [
     files, activeFileIndex, diffStyle, diffOverflow, diffIndicators,
@@ -984,7 +1034,8 @@ const ReviewApp: React.FC = () => {
     aiAvailable, aiChat.messages, aiChat.isCreatingSession, aiChat.isStreaming,
     handleAskAI, handleViewAIResponse, handleClickAIMarker,
     aiHistoryForSelection, agentJobs.jobs, prMetadata, prContext,
-    isPRContextLoading, prContextError, fetchPRContext, openDiffFile,
+    isPRContextLoading, prContextError, fetchPRContext,
+    activeFilePRComments, handleRespondToPRComment, openDiffFile,
   ]);
 
   // Copy raw diff to clipboard
@@ -1468,7 +1519,7 @@ const ReviewApp: React.FC = () => {
                   }
                   isLoading={isSendingFeedback || isPlatformActioning}
                   muted={!platformMode && totalAnnotationCount === 0 && !isSendingFeedback && !isApproving && !isPlatformActioning}
-                  label={platformMode ? 'Post Comments' : 'Send Feedback'}
+                  label={spawnMode ? 'Send to Claude' : platformMode ? 'Post Comments' : 'Send Feedback'}
                   loadingLabel={platformMode ? 'Posting...' : 'Sending...'}
                   title={!platformMode && totalAnnotationCount === 0 ? "Add annotations to send feedback" : "Send feedback"}
                 />
@@ -1477,6 +1528,10 @@ const ReviewApp: React.FC = () => {
                 <div className="relative group/approve">
                   <ApproveButton
                     onClick={() => {
+                      if (spawnMode) {
+                        window.close();
+                        return;
+                      }
                       if (platformMode) {
                         if (platformUser && prMetadata?.author === platformUser) return;
                         setPlatformGeneralComment('');
@@ -1501,6 +1556,8 @@ const ReviewApp: React.FC = () => {
                         ? `You can't approve your own ${mrLabel}`
                         : "Approve - no changes needed"
                     }
+                    label={spawnMode ? 'Dismiss' : 'Approve - no changes needed'}
+                    loadingLabel={spawnMode ? 'Dismissing...' : 'Approving...'}
                   />
                   {/* Tooltip: own PR warning OR annotations-lost warning */}
                   {platformMode && platformUser && prMetadata?.author === platformUser ? (
@@ -1688,6 +1745,10 @@ const ReviewApp: React.FC = () => {
             editorAnnotations={editorAnnotations}
             onDeleteEditorAnnotation={deleteEditorAnnotation}
             prMetadata={prMetadata}
+            prContext={prContext}
+            isPRContextLoading={isPRContextLoading}
+            prContextError={prContextError}
+            onFetchPRContext={fetchPRContext}
             aiAvailable={aiAvailable}
             aiMessages={aiChat.messages}
             isAICreatingSession={aiChat.isCreatingSession}

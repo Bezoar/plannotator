@@ -10,8 +10,10 @@ import { useAnnotationToolbar } from '../hooks/useAnnotationToolbar';
 import { FileHeader } from './FileHeader';
 import { InlineAnnotation } from './InlineAnnotation';
 import { InlineAIMarker } from './InlineAIMarker';
+import { PRInlineComment } from './PRInlineComment';
 import { AnnotationToolbar } from './AnnotationToolbar';
 import type { AIChatEntry } from '../hooks/useAIChat';
+import type { PRInlineComment as PRInlineCommentType } from '@plannotator/shared/pr-provider';
 import { SuggestionModal } from './SuggestionModal';
 import { type ReviewSearchMatch } from '../utils/reviewSearch';
 import {
@@ -139,6 +141,9 @@ interface DiffViewerProps {
   onClickAIMarker?: (questionId: string) => void;
   /** AI messages overlapping the current pending selection */
   aiHistoryMessages?: AIChatEntry[];
+  // PR inline comments
+  prInlineComments?: PRInlineCommentType[];
+  onRespondToPRComment?: (commentId: number, response: string) => void;
 }
 
 export const DiffViewer: React.FC<DiffViewerProps> = ({
@@ -181,6 +186,8 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
   aiMessages = [],
   onClickAIMarker,
   aiHistoryMessages = [],
+  prInlineComments = [],
+  onRespondToPRComment,
 }) => {
   const { theme, colorTheme, resolvedMode } = useTheme();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -379,9 +386,26 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
       }));
   }, [aiMessages]);
 
+  // Derive PR inline comment markers for the current file
+  const prCommentAnnotations = useMemo(() => {
+    if (!prInlineComments.length) return [];
+    return prInlineComments
+      .filter(c => c.line != null)
+      .map(c => ({
+        side: c.side === 'LEFT' ? 'deletions' as const : 'additions' as const,
+        lineNumber: c.line!,
+        metadata: {
+          annotationId: `pr-comment-${c.id}`,
+          type: 'comment' as CodeAnnotationType,
+          kind: 'pr-comment' as const,
+          prComment: c,
+        } as DiffAnnotationMetadata,
+      }));
+  }, [prInlineComments]);
+
   const mergedAnnotations = useMemo(
-    () => [...lineAnnotations, ...aiLineAnnotations],
-    [lineAnnotations, aiLineAnnotations],
+    () => [...lineAnnotations, ...aiLineAnnotations, ...prCommentAnnotations],
+    [lineAnnotations, aiLineAnnotations, prCommentAnnotations],
   );
 
   // Handle edit: find annotation and start editing in toolbar
@@ -390,7 +414,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
     if (ann) toolbar.startEdit(ann);
   }, [annotations, toolbar.startEdit]);
 
-  // Render annotation or AI marker in diff
+  // Render annotation, AI marker, or PR inline comment in diff
   const renderAnnotation = useCallback((annotation: { side: string; lineNumber: number; metadata?: DiffAnnotationMetadata }) => {
     if (!annotation.metadata) return null;
 
@@ -406,6 +430,15 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
       );
     }
 
+    if (annotation.metadata.kind === 'pr-comment' && annotation.metadata.prComment) {
+      return (
+        <PRInlineComment
+          comment={annotation.metadata.prComment}
+          onRespond={onRespondToPRComment ?? (() => {})}
+        />
+      );
+    }
+
     return (
       <InlineAnnotation
         metadata={annotation.metadata}
@@ -415,7 +448,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
         onDelete={onDeleteAnnotation}
       />
     );
-  }, [filePath, onSelectAnnotation, handleEdit, onDeleteAnnotation, onClickAIMarker]);
+  }, [filePath, onSelectAnnotation, handleEdit, onDeleteAnnotation, onClickAIMarker, onRespondToPRComment]);
 
   // Render hover utility (+ button)
   const renderHoverUtility = useCallback((getHoveredLine: () => { lineNumber: number; side: 'deletions' | 'additions' } | undefined) => {
