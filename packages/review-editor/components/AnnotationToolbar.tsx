@@ -1,10 +1,12 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { ToolbarState } from '../hooks/useAnnotationToolbar';
 import { useTabIndent } from '../hooks/useTabIndent';
 import { formatLineRange } from '../utils/formatLineRange';
 import { AskAIInput } from './AskAIInput';
 import { SparklesIcon } from './SparklesIcon';
 import type { AIChatEntry } from '../hooks/useAIChat';
+import { useDraggable } from '@plannotator/ui/hooks/useDraggable';
 
 interface AnnotationToolbarProps {
   toolbarState: ToolbarState;
@@ -15,6 +17,7 @@ interface AnnotationToolbarProps {
   setSuggestedCode: React.Dispatch<React.SetStateAction<string>>;
   showSuggestedCode: boolean;
   setShowSuggestedCode: (show: boolean) => void;
+  selectedOriginalCode?: string;
   isEditing?: boolean;
   setShowCodeModal: (show: boolean) => void;
   onSubmit: () => void;
@@ -39,6 +42,7 @@ export const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
   setSuggestedCode,
   showSuggestedCode,
   setShowSuggestedCode,
+  selectedOriginalCode,
   isEditing = false,
   setShowCodeModal,
   onSubmit,
@@ -50,8 +54,15 @@ export const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
   onViewAIResponse,
   aiHistoryMessages = [],
 }) => {
+  const suggestedCodeRef = useRef<HTMLTextAreaElement>(null);
   const handleTabIndent = useTabIndent(setSuggestedCode);
   const [askAIMode, setAskAIMode] = useState(false);
+  const { dragPosition, dragHandleProps, wasDragged, reset: resetDrag } = useDraggable(toolbarRef);
+
+  // Reset drag when toolbar reopens for a new selection
+  useEffect(() => {
+    resetDrag();
+  }, [toolbarState.range.start, toolbarState.range.end, toolbarState.range.side, resetDrag]);
 
   const handleAskAIClick = () => {
     // If user already typed text in the comment box, send it directly as an AI question
@@ -74,17 +85,20 @@ export const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
     onCancel(); // close the whole toolbar
   };
 
-  return (
+  const content = (
     <div
       ref={toolbarRef}
       className="review-toolbar"
-      style={{
-        position: 'fixed',
-        top: Math.min(toolbarState.position.top, window.innerHeight - 200),
-        left: Math.max(150, Math.min(toolbarState.position.left, window.innerWidth - 150)),
-        transform: 'translateX(-50%)',
-        zIndex: 1000,
-      }}
+      style={dragPosition
+        ? { position: 'fixed', top: dragPosition.top, left: dragPosition.left, zIndex: 1000 }
+        : {
+            position: 'fixed',
+            top: Math.min(toolbarState.position.top, window.innerHeight - 200),
+            left: Math.max(150, Math.min(toolbarState.position.left, window.innerWidth - 150)),
+            transform: 'translateX(-50%)',
+            zIndex: 1000,
+          }
+      }
     >
       {askAIMode ? (
         <AskAIInput
@@ -96,10 +110,11 @@ export const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
           aiHistory={aiHistoryMessages}
           onViewResponse={onViewAIResponse}
           onSwitchToComment={() => setAskAIMode(false)}
+          dragHandleProps={dragHandleProps}
         />
       ) : (
         <div className="w-80">
-          <div className="flex items-center justify-between mb-2">
+          <div className="flex items-center justify-between mb-2" {...dragHandleProps}>
             <span className="text-xs text-muted-foreground">
               {isEditing ? 'Edit annotation' : formatLineRange(toolbarState.range.start, toolbarState.range.end)}
             </span>
@@ -146,6 +161,7 @@ export const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
                 </button>
               </div>
               <textarea
+                ref={suggestedCodeRef}
                 value={suggestedCode}
                 onChange={(e) => setSuggestedCode(e.target.value)}
                 placeholder="Enter code suggestion..."
@@ -164,7 +180,22 @@ export const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
             </div>
           ) : (
             <button
-              onClick={() => setShowSuggestedCode(true)}
+              onClick={() => {
+                setShowSuggestedCode(true);
+
+                const prefill = !suggestedCode && selectedOriginalCode;
+                if (prefill) {
+                  setSuggestedCode(selectedOriginalCode);
+
+                  // Focus at the end of the textarea
+                  requestAnimationFrame(() => {
+                    const ta = suggestedCodeRef.current;
+                    if (ta) {
+                      ta.setSelectionRange(ta.value.length, ta.value.length);
+                    }
+                  });
+                }
+              }}
               className="mt-2 text-xs text-muted-foreground hover:text-foreground flex items-center gap-1 transition-colors"
             >
               <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -205,4 +236,10 @@ export const AnnotationToolbar: React.FC<AnnotationToolbarProps> = ({
       )}
     </div>
   );
+
+  if (typeof document === 'undefined') {
+    return content;
+  }
+
+  return createPortal(content, document.body);
 };

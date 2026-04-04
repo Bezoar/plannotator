@@ -19,6 +19,9 @@
 @import "./themes/terminal.css";
 @import "./themes/tokyo-night.css";
 @import "./themes/tinacious.css";
+@import "./themes/cursor.css";
+@import "./themes/cursor-hc.css";
+@import "./themes/cursor-midnight.css";
 @import "./print.css";
 
 /* Tailwind bridge — maps CSS vars to utility classes */
@@ -115,4 +118,18 @@ body {
 :focus-visible {
   outline: 2px solid var(--ring);
   outline-offset: 2px;
+}
+
+/* Flash highlight for annotated files in sidebar */
+.file-annotation-flash {
+  animation: file-flash 1.2s ease-out;
+}
+
+@keyframes file-flash {
+  0% { background: transparent; }
+  10% { background: var(--muted); }
+  30% { background: transparent; }
+  45% { background: var(--muted); }
+  65% { background: transparent; }
+  100% { background: transparent; }
 }
